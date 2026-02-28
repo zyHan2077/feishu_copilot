@@ -2,13 +2,30 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+/**
+ * One copilot session (one /on → /exit lifecycle).
+ * session_label is the human-readable ID generated at /on time and used as tmux window name.
+ * copilot_resume_id is the UUID extracted from copilot's exit output (only set after /exit).
+ */
+export interface CopilotSession {
+  session_label: string;          // "project-YYMMDD-HHMM" — tmux window name
+  thread_id: string;              // Feishu thread_id (omt_xxx)
+  anchor_msg_id: string;          // message_id of the "启动中" anchor (main chat)
+  thread_first_msg_id: string;    // message_id of the "已就绪" message (edited after exit)
+  ready_text: string;             // original "已就绪" text (needed for the edit)
+  copilot_resume_id?: string;     // UUID from copilot --resume= (only after /exit)
+  started_at: string;             // ISO-8601
+  ended_at?: string;              // ISO-8601
+  is_running: boolean;
+}
+
 export interface BotState {
   chat_id: string;
   workdir: string;
   project: string;
-  devs: string[];           // open_id list
-  copilot_running: boolean;
+  devs: string[];
   initialized_at: string;
+  sessions: CopilotSession[];     // all sessions for this chat, newest last
 }
 
 const STATE_FILENAME = '.feishu_copilot_state.json';
@@ -41,11 +58,39 @@ export function stateFilePath(workdir: string): string {
 export function loadState(workdir: string): BotState | null {
   const file = stateFilePath(workdir);
   try {
-    const raw = fs.readFileSync(file, 'utf-8');
-    return JSON.parse(raw) as BotState;
+    const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    return migrateState(raw);
   } catch {
     return null;
   }
+}
+
+/**
+ * Migrate old single-session flat fields (pre-sessions[]) to the new sessions[] schema.
+ */
+function migrateState(raw: Record<string, unknown>): BotState {
+  let sessions: CopilotSession[] = (raw.sessions as CopilotSession[]) ?? [];
+  if (!raw.sessions && (raw.copilot_thread_id || raw.copilot_anchor_msg_id || raw.copilot_running)) {
+    const legacy: CopilotSession = {
+      session_label: (raw.session_id as string) ?? 'legacy',
+      thread_id: (raw.copilot_thread_id as string) ?? '',
+      anchor_msg_id: (raw.copilot_anchor_msg_id as string) ?? '',
+      thread_first_msg_id: '',
+      ready_text: '✅ Copilot 已就绪，在此话题中回复即可交互。',
+      copilot_resume_id: (raw.copilot_resume_id as string) ?? undefined,
+      started_at: (raw.initialized_at as string) ?? new Date().toISOString(),
+      is_running: !!(raw.copilot_running),
+    };
+    sessions = [legacy];
+  }
+  return {
+    chat_id: raw.chat_id as string,
+    workdir: raw.workdir as string,
+    project: raw.project as string,
+    devs: (raw.devs as string[]) ?? [],
+    initialized_at: (raw.initialized_at as string) ?? new Date().toISOString(),
+    sessions,
+  };
 }
 
 /**
@@ -87,4 +132,26 @@ export function updateState(chatId: string, patch: Partial<BotState>): BotState 
   const updated = { ...state, ...patch };
   saveState(updated);
   return updated;
+}
+
+/**
+ * Find a session that matches the given Feishu thread_id or root message id (anchor).
+ */
+export function getSessionByThread(
+  state: BotState,
+  threadId: string | undefined,
+  rootMsgId: string | undefined,
+): CopilotSession | undefined {
+  return state.sessions.find(
+    (s) =>
+      (threadId && s.thread_id && threadId === s.thread_id) ||
+      (rootMsgId && s.anchor_msg_id && rootMsgId === s.anchor_msg_id),
+  );
+}
+
+/**
+ * Return the most recently ended (non-running) session, if any.
+ */
+export function getLastEndedSession(state: BotState): CopilotSession | undefined {
+  return [...state.sessions].reverse().find((s) => !s.is_running && s.ended_at);
 }

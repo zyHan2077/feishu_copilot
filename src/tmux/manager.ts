@@ -2,11 +2,13 @@ import { execSync, spawnSync } from 'child_process';
 
 /**
  * Create a new detached tmux session. No-op if session already exists.
+ * Optional firstWindowName names the initial window (avoids extra blank bash window).
  */
-export function createSession(sessionName: string, workdir: string): void {
+export function createSession(sessionName: string, workdir: string, firstWindowName?: string): void {
   const exists = sessionExists(sessionName);
   if (!exists) {
-    execSync(`tmux new-session -d -s ${shellEsc(sessionName)} -c ${shellEsc(workdir)}`);
+    const nameFlag = firstWindowName ? ` -n ${shellEsc(firstWindowName)}` : '';
+    execSync(`tmux new-session -d -s ${shellEsc(sessionName)} -c ${shellEsc(workdir)}${nameFlag}`);
   }
 }
 
@@ -62,11 +64,13 @@ export function killWindow(sessionName: string, windowName: string): void {
 
 /**
  * Send keystrokes to a pane (window name defaults to session base window).
+ * Uses two separate spawnSync calls: one for text (literal mode), one for Enter.
+ * Combining text + 'Enter' in a single call silently drops Enter on some TUIs.
  */
 export function sendKeys(sessionName: string, windowName: string, keys: string): void {
-  execSync(
-    `tmux send-keys -t ${shellEsc(sessionName)}:${shellEsc(windowName)} ${shellEsc(keys)} Enter`
-  );
+  const target = `${sessionName}:${windowName}`;
+  spawnSync('tmux', ['send-keys', '-t', target, '-l', keys]);
+  spawnSync('tmux', ['send-keys', '-t', target, 'Enter']);
 }
 
 /**

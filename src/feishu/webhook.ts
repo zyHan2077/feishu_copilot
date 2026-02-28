@@ -117,6 +117,8 @@ async function handleEvent(body: Record<string, unknown>): Promise<void> {
   const chatId: string = (msg.chat_id as string) ?? '';
   const senderId: string = (sender.sender_id as Record<string, string>)?.open_id ?? '';
   const msgType: string = (msg.message_type as string) ?? '';
+  const threadId: string = (msg.thread_id as string) ?? '';
+  const rootMsgId: string = (msg.root_id as string) ?? '';
 
   // Ignore private/direct messages
   if (chatType !== 'group') return;
@@ -138,5 +140,7 @@ async function handleEvent(body: Record<string, unknown>): Promise<void> {
     .replace(/<at[^>]*>[^<]*<\/at>/g, '')
     .trim();
 
-  await routeMessage({ chatId, senderId, text, rawContent });
+  const msgId: string = (msg.message_id as string) ?? '';
+
+  await routeMessage({ chatId, senderId, text, rawContent, messageId: msgId || undefined, threadId: threadId || undefined, rootMsgId: rootMsgId || undefined });
 }

@@ -50,8 +50,8 @@ export async function handleInit(chatId: string, senderId: string, text: string)
     workdir,
     project,
     devs,
-    copilot_running: false,
     initialized_at: new Date().toISOString(),
+    sessions: [],
   };
   saveState(state);
   registerChat(chatId, workdir);

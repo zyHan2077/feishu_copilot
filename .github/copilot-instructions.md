@@ -1,8 +1,8 @@
 # Feishu Copilot Bot — Copilot Instructions
 
-## Copilot Role: Server Administrator
+## Copilot Role: Server Administrator and Developer
 
-**You (Copilot) are the administrator of this Feishu bot backend server** (`/home/ubuntu/feishu_copilot`).
+**You (Copilot) are the administrator and Developer of this Feishu bot backend server** (`/home/ubuntu/feishu_copilot`). Everytime you make meaningful or substantial change to the server code, configuration, deployment process, or you learned anything that is relevant and important to memorize, you must update this instruction file with the new rules, commands, and procedures. This file serves as the main source of truth for how to operate and maintain the server, so it must be kept up-to-date and accurate at all times.
 
 ### Server Startup Rules (MANDATORY — no exceptions)
 
@@ -100,88 +100,72 @@ After initialisation:
 
 ### 4. Copilot session management
 
-Primary developer commands (slash-prefixed; no @mention required):
+The bot supports **multiple concurrent Copilot sessions** per group, each with its own tmux window and Feishu thread.
 
-| User message | Bot action |
-|---|---|
-| `/on` (alias: `启动 copilot` / `start copilot`) | Start a Copilot session inside the tmux session (see §4.1). Only one session per workdir allowed. |
-| `/off` (alias: `停止 copilot` / `stop copilot`) | Send `q` + Enter to the Copilot pane, then kill the pane. |
-| `/id` / `whoami` | Reply with the sender's `open_id`. |
-| `/h` / `/help` / `help` / `帮助` | Show command reference. |
-| `/log <subcmd>` (or `查看日志 <subcmd>`) | Query the session log (see §6). |
-| `/init <workdir> <project> <devs>` | Re-initialise (allowed from existing devs). |
-| Any other `/` command | Forwarded verbatim to the Copilot pane. |
+Primary developer commands:
 
-Non-slash text from a developer (no `/` prefix) is **forwarded directly to the Copilot pane** without any command matching.
+| Context | Command | Bot action |
+|---|---|---|
+| Main chat | `/on [model=<name>]` (alias: `启动 copilot` / `start copilot`) | Start a new Copilot session; creates a new Feishu thread. Optional `model=` sets `copilot --model <name>`. |
+| Main chat | `/resume session-id=<UUID>` | Create a new thread and resume the given session via `copilot --resume=<UUID>`. |
+| Main chat | `/id` / `whoami` | Reply with the sender's `open_id`. |
+| Main chat | `/h` / `/help` / `help` / `帮助` | Show command reference. |
+| Main chat | `/log <subcmd>` (or `查看日志 <subcmd>`) | Query the session log (see §6). |
+| Main chat | `/init <workdir> <project> <devs>` | Re-initialise (allowed from existing devs). |
+| Thread | Any non-slash text | Forwarded verbatim to the Copilot TUI. |
+| Thread | `/exit` | Gracefully exit the session (see §4.2). |
+| Thread | `/resume` | Resume the most-recently-ended session in this same thread (see §4.3). |
 
-#### 4.1 Starting a Copilot session
+#### 4.1 Starting a Copilot session (`/on`)
+
+- A `session_label` of the form `"<project>-YYMMDD-HHMM"` is generated **before** copilot starts. This becomes the **tmux window name**.
+- Start command: `copilot` (or `copilot --resume=<UUID>` if a resume ID was provided).
+- After starting, poll the pane until the first prompt appears (timeout 15 s), then create a Feishu thread (话题).
+
 ```bash
-# Inside the named tmux session, create a new window called "copilot"
-tmux new-window -t <project> -n copilot
-tmux send-keys -t <project>:copilot "copilot" Enter
+# First /on: create session with first window named after session_label
+tmux new-session -d -s <project> -c <workdir> -n <session_label>
+tmux send-keys -t <project>:<session_label> -l "copilot"
+tmux send-keys -t <project>:<session_label> Enter
+
+# Subsequent /on (session exists, create new window):
+tmux new-window -t <project> -n <session_label>
+tmux send-keys -t <project>:<session_label> -l "copilot"
+tmux send-keys -t <project>:<session_label> Enter
 ```
-- If a window named `copilot` already exists in the session, reply: `⚠️ Copilot session 已在运行。`
-- After starting, poll the pane until the first prompt appears (timeout 15 s), then relay output to the group.
 
-### 5. Forwarding messages to Copilot
+> ⚠️ **send-keys must use two separate calls** (text with `-l` flag, then `Enter` separately). Combining them in one spawnSync call silently drops the Enter keystroke in TUI mode.
 
-When the Copilot session is running and a developer sends any text that is **not** a slash-command:
-1. Strip any @mention prefix from the message.
-2. Send the text as keystrokes to the Copilot pane:
-   ```bash
-   tmux send-keys -t <project>:copilot "<user message>" Enter
-   ```
-3. If a previous forward is still pending, reply: `⏳ Copilot 仍在执行，请稍候…` and do not re-send.
-4. **Do not echo the user's message back to the group.**
-5. Poll the tmux pane output (every 500 ms) until idle for ≥ 2 s (or 60 s timeout):
-   - Capture: `tmux capture-pane -t <project>:copilot -p`
-   - Diff against the pre-send snapshot to extract only new lines.
-   - Strip ANSI escape codes, separator lines, box borders, spinners, shell prompts.
-   - Relay cleaned output to the group.
+#### 4.2 Exiting a session (`/exit` in thread)
 
-#### 5.1 Interactive / keyboard-choice prompts
-Copilot CLI sometimes presents a numbered or Y/N menu. When new pane output contains a recognised prompt pattern:
-- Detect lines matching: `^\s*[\d]+[.)]\s+`, `\[Y/n\]`, `\[y/N\]`, `(yes/no)`, `Press enter`, `↑/↓`, or similar.
-- Forward the prompt text to the group as-is.
-- The next message from the developer in the group is treated as the raw keystroke(s) to send:
-  - Single digit → send that digit + Enter.
-  - `y` / `yes` → send `y` + Enter.
-  - `n` / `no` → send `n` + Enter.
-  - Any other text → send verbatim + Enter.
-- This normalises all interactive prompts to standard IM input.
+1. Send `/exit` to the Copilot TUI.
+2. Poll for idle output (15 s).
+3. Extract UUID: regex `/copilot --resume=([0-9a-f-]{36})/` from the raw output.
+4. Post exit summary to the thread: `🛑 Session 已结束\n\n<output>`.
+5. If UUID found, call `editMessage(thread_first_msg_id, ready_text + '\n🔑 Resume: copilot --resume=<UUID>')` to append the resume ID to the "已就绪" message.
+6. Kill the tmux window.
+7. Update state: `is_running=false`, `ended_at`, `copilot_resume_id=uuid`.
 
-### 6. Log persistence
+#### 4.3 Resuming a session (`/resume` in thread)
 
-- All tmux pane output is continuously appended to `<workdir>/copilot_session.log`.
-- Implement a background loop (every 5 s) that captures the full pane and appends new lines to the log file.
-- Log lines are prefixed with an ISO-8601 timestamp: `[2026-02-24T03:51:00Z] <line>`.
+Allowed only if the session for this thread is the **most recently ended** session for the chat (determined by `ended_at` order in `sessions[]`). Starts a new tmux window with a new `session_label` and sends `copilot --resume=<UUID>`; I/O continues in the same thread.
+- See **[docs/copilot-cli-tmux.md](../docs/copilot-cli-tmux.md)** for full details on PTY mode, send-keys usage, and pitfalls.
 
-Developer log-query commands:
-```
-/log tail [N]           → tail -n N  <workdir>/copilot_session.log  (default 50)
-/log head [N]           → head -n N  <workdir>/copilot_session.log  (default 50)
-/log grep <pattern>     → grep <pattern> <workdir>/copilot_session.log
-/log sed <expr>         → sed <expr> <workdir>/copilot_session.log
-/log awk <expr>         → awk <expr> <workdir>/copilot_session.log
-/log wc [flags]         → wc <flags> <workdir>/copilot_session.log
-/log cat                → cat <workdir>/copilot_session.log
-```
-Legacy prefix `查看日志 <subcmd>` is normalised to `/log <subcmd>` internally.
-The bot executes the command and returns its stdout (truncated to ≤ 4000 chars to stay within Feishu message limits).
+### 5. Forwarding Messages to Copilot
 
-### 7. Progress tracking
+Non-slash developer messages → strip @mention → snapshot baseline → `sendKeys(text)` + separate `sendKeys(Enter)` → poll until idle (500 ms interval, 2 s idle threshold, 60 s timeout) → diff output → clean → relay to thread.
 
-- After every significant state change (**init**, **copilot stop**), the bot appends an entry to `<workdir>/progress.md`:
+> ⚠️ **send-keys critical rule**: always use **two separate `spawnSync` calls** — one for the text (with `-l` literal flag), one for `Enter`. Combining them as `['send-keys', ..., text, 'Enter']` silently drops the Enter keystroke when targeting a TUI (verified on Copilot CLI). This affects every message forwarded to Copilot.
 
-  ```markdown
-  ## 26-02-24-03-51  初始化完成
-  工作目录: /home/ubuntu/projects/myapp
-  项目名称: myapp
-  开发人员: ou_alice, ou_bob
-  tmux session: myapp
-  ```
+See **[docs/bot-behavior.md §5](../docs/bot-behavior.md)** for full details: interactive prompt handling, output cleaning patterns, and concurrent-request guard.
 
-- The incremental update content is also **sent to the Feishu group** immediately after being written.
+### 6. Log Persistence
+
+Background loop (every 5 s) appends new pane lines (ISO-8601 prefixed) to `<workdir>/copilot_session.log`. Developer commands: `/log tail|head|grep|sed|awk|wc|cat [args]` (output truncated to 4000 chars). See **[docs/bot-behavior.md §6](../docs/bot-behavior.md#6-log-persistence)**.
+
+### 7. Progress Tracking
+
+On significant state changes (init, copilot stop), append a timestamped entry to `<workdir>/progress.md` and send it to the group. See **[docs/bot-behavior.md §7](../docs/bot-behavior.md#7-progress-tracking)**.
 
 ---
 
@@ -189,12 +173,24 @@ The bot executes the command and returns its stdout (truncated to ≤ 4000 chars
 
 ```jsonc
 {
-  "chat_id": "oc_xxxxxxxx",        // Feishu group chat ID
+  "chat_id": "oc_xxxxxxxx",
   "workdir": "/absolute/path",
   "project": "myapp",
-  "devs": ["ou_alice", "ou_bob"],  // open_id list
-  "copilot_running": false,
-  "initialized_at": "2026-02-24T03:51:00Z"
+  "devs": ["ou_alice", "ou_bob"],
+  "initialized_at": "2026-02-24T03:51:00Z",
+  "sessions": [
+    {
+      "session_label": "myapp-260301-0133",   // tmux window name; generated at /on time
+      "thread_id": "omt_xxx",
+      "anchor_msg_id": "om_xxx",              // "启动中" message in main chat
+      "thread_first_msg_id": "om_yyy",        // "已就绪" message (edited after /exit)
+      "ready_text": "✅ Copilot 已就绪…",     // original text for edit reconstruction
+      "copilot_resume_id": "9610b4bb-…",      // UUID from exit output (only after /exit)
+      "started_at": "2026-03-01T01:33:00Z",
+      "ended_at": "2026-03-01T01:35:00Z",
+      "is_running": false
+    }
+  ]
 }
 ```
 
@@ -205,9 +201,18 @@ The bot executes the command and returns its stdout (truncated to ≤ 4000 chars
 | Action | Endpoint |
 |---|---|
 | Send group message | `POST /im/v1/messages?receive_id_type=chat_id` |
+| Reply & create thread | `POST /im/v1/messages/{message_id}/reply` (body: `reply_in_thread: true`) |
+| Send to thread | `POST /im/v1/messages?receive_id_type=thread_id` |
+| Update thread name | `PATCH /im/v1/threads/{thread_id}` (body: `{ "name": "..." }`) — **⛔ returns 404, not supported** |
+| Edit message content | `PUT /im/v1/messages/{message_id}` (body: `{ msg_type, content }`) — supports **text** and **post** (rich text) only; card messages use a different API |
 | Rename group | `PUT /im/v1/chats/{chat_id}` body `{ "name": "..." }` |
+| Add emoji reaction | `POST /im/v1/messages/{message_id}/reactions` (body: `{ reaction_type: { emoji_type: "Get" } }`) |
 | Get user info | `GET /contact/v3/users/{user_id}` |
 | Receive events | Webhook POST to `/webhook/event` (configured in Feishu Open Platform) |
+
+> ⚠️ **Emoji reactions require** the `im:message.reactions:write_only` scope on the bot app (Feishu Open Platform → app → Auth → 机器人 scopes). Emoji type strings are **case-sensitive**: `"Get"` = 了解, `"THUMBSUP"` = 👍, `"OK"` = OK.
+
+> ⚠️ **Thread API response quirk**: `POST /im/v1/messages/{id}/reply` returns the new message at `resp.data.data` directly — there is **no** `resp.data.data.message` nesting layer. See **[docs/feishu-thread-api.md](../docs/feishu-thread-api.md)** for full thread API details and the thread-detection strategy.
 
 All API calls require a tenant access token obtained via:
 ```
@@ -296,35 +301,44 @@ tmux send-keys -t copilot-feishu "cd /home/ubuntu/feishu_copilot && npm run buil
 
 > ⚠️ **禁止**使用 `pkill` / `killall`，若需要 kill 进程必须用 `kill <PID>`（数字 PID）。
 
-### Webhook 验签说明（加密模式）
+> ⚠️ **禁止**向 PTY 从设备（`/dev/pts/N`）写入任何内容来驱动 Copilot CLI 输入——这会破坏 TUI 渲染状态，导致 `tmux send-keys` 失效。正确方法是始终通过 `tmux send-keys -t <target> text Enter`。
+> 详见 **[docs/copilot-cli-tmux.md](../docs/copilot-cli-tmux.md)**。
 
-飞书开启 Encrypt Key 后，事件以 `{ "encrypt": "..." }` 形式到达。解密流程：
+### 调试 Copilot CLI 交互时的注意事项
 
-1. `key = SHA256(encryptKey)` 的前 32 字节
-2. `buf = base64decode(encrypted)`
-3. `iv = buf[0:16]`，`ciphertext = buf[16:]`
-4. AES-256-CBC 解密 → JSON
+- 优先使用**快速命令**（`/model`、`/context`、`/help`）验证 send-keys 通路，避免等待 LLM 响应。
+- 测试 LLM 实际响应时，先执行 `/model gpt-5-mini`——该模型在 Copilot Pro 计划中**免费**（不消耗 premium 配额）。
+- 每次 `/on` 产生**一个 tmux 窗口**，窗口名 = `session_label`（形如 `project-YYMMDD-HHMM`）。`new-session` 时传 `-n <session_label>` 来避免额外的空 bash 窗口。
 
-解密成功后，用**解密后的 body** 做 token 验证：
-- v1 事件：`body.token === FEISHU_VERIFICATION_TOKEN`
-- v2 事件：`body.header.token === FEISHU_VERIFICATION_TOKEN`
+### 架构变更后的必做清理（Schema/tmux 管理方式变动后）
 
-> ⚠️ **常见 Bug**：用加密原文（`req.body = { encrypt: "..." }`）做 token 验证，永远失败 → 返回 401 → 事件丢弃。
-> **正确做法**：解密后将 decryptedBody 传入验签函数，用 decryptedBody 的 token 字段比对。
+每次对 tmux session 管理方式或 state schema 进行重大变更（如重命名窗口命名规则、新增/删除 state 字段、改变 session 生命周期），必须执行以下清理步骤，确保用户有 fresh start：
 
-飞书 X-Lark-Signature 的正确算法是 **SHA256**（非 HMAC）：
-```
-signature = sha256(timestamp + nonce + encryptKey + rawBody).hexdigest()
-```
+1. **列出并杀掉所有由程序创建的 project tmux session**（保留 `copilot-feishu`、`qinji`、`web` 等基础设施 session）：
+   ```bash
+   # 查找所有 project session（不是 copilot-feishu / qinji / web）
+   tmux list-sessions
+   # 按需 kill：
+   tmux kill-session -t <project_name>
+   ```
 
-### 订阅事件类型
+2. **检查并重写所有 state 文件到新 schema**（删除废弃字段，确保符合当前 `BotState` 接口）：
+   ```bash
+   find /home -name '.feishu_copilot_state.json' 2>/dev/null
+   # 用 python3 重写成新格式，保留 chat_id/workdir/project/devs/initialized_at，sessions=[]
+   ```
 
-飞书开放平台需订阅以下事件，机器人才能正常工作：
+3. **重启 server**（使新 dist 生效）：
+   ```bash
+   tmux send-keys -t copilot-feishu "C-c" ""
+   tmux send-keys -t copilot-feishu "npm run build && npm start" Enter
+   ```
 
-| 事件 | 用途 |
-|---|---|
-| `im.message.receive_v1` | 收到群消息（@mention） |
-| `im.chat.member.bot.added_v1` | 机器人被邀请进群 → 自动发初始化提示 |
+### Webhook 验签 & 事件订阅
+
+加密模式下用 AES-256-CBC 解密后再做 token 验证；签名算法是 `sha256(timestamp+nonce+encryptKey+rawBody)`。  
+需订阅事件：`im.message.receive_v1`（群消息）、`im.chat.member.bot.added_v1`（bot 入群）。  
+详见 **[docs/feishu-webhook.md](../docs/feishu-webhook.md)**（含常见验签 Bug 说明和消息字段参考）。
 
 ---
 
