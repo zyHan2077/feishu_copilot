@@ -2,3 +2,4 @@ node_modules/
 dist/
 .env
 *.log
+.feishu_copilot_state.json
