@@ -1,0 +1,55 @@
+{
+  "chat_id": "oc_461a63fc3733037e129e5a6b5d99db77",
+  "workdir": "/home/ubuntu/feishu_copilot",
+  "project": "feishu_copilot",
+  "devs": [
+    "ou_5c91d9db89a8b7250f406af495603e90"
+  ],
+  "initialized_at": "2026-02-28T18:52:43.038Z",
+  "sessions": [
+    {
+      "session_label": "feishu_copilot-260301-0259",
+      "thread_id": "omt_1ac6b3c2d14f5b96",
+      "anchor_msg_id": "om_x100b5507fe72f8a4c3a98267bda702e",
+      "thread_first_msg_id": "om_x100b5507fe3ab0a8c36885cd0acdd79",
+      "ready_text": "✅ Copilot 已就绪，在此话题中回复即可交互。",
+      "started_at": "2026-02-28T18:59:23.416Z",
+      "is_running": false,
+      "ended_at": "2026-02-28T19:13:41.643Z",
+      "copilot_resume_id": "0c10f861-6a0e-4040-94d9-956db779621a"
+    },
+    {
+      "session_label": "feishu_copilot-260301-0304",
+      "thread_id": "omt_1ac6b4eb2f0f5bee",
+      "anchor_msg_id": "om_x100b55078ced1ca4c423c246af366d2",
+      "thread_first_msg_id": "om_x100b55078c95dca0c4ed4caf2ffcda0",
+      "ready_text": "✅ Copilot 已就绪，在此话题中回复即可交互。",
+      "started_at": "2026-02-28T19:04:01.448Z",
+      "is_running": false,
+      "ended_at": "2026-02-28T19:15:46.663Z",
+      "copilot_resume_id": "31add825-e4da-454b-b440-9cd355ae3090"
+    },
+    {
+      "session_label": "feishu_copilot-260301-0317",
+      "thread_id": "omt_1ac6b7f0e1cf5b9a",
+      "anchor_msg_id": "om_x100b5507bd51f0a4c36967a54385668",
+      "thread_first_msg_id": "om_x100b5507bd193ca0c3d2ccb0c6c7a8e",
+      "ready_text": "✅ Copilot 已就绪，在此话题中回复即可交互。",
+      "started_at": "2026-02-28T19:17:13.190Z",
+      "is_running": false,
+      "ended_at": "2026-02-28T19:23:33.731Z",
+      "copilot_resume_id": "7550be91-1b1a-4932-85d2-58c27c2c6a80"
+    },
+    {
+      "session_label": "feishu_copilot-260301-0323",
+      "thread_id": "omt_1ac6c806964f1b97",
+      "anchor_msg_id": "om_x100b5500423688a0c3bdc93278967eb",
+      "thread_first_msg_id": "om_x100b550043ff60a0c4f2dabe62a9d9f",
+      "ready_text": "✅ Copilot 已就绪，在此话题中回复即可交互。",
+      "started_at": "2026-02-28T19:23:59.109Z",
+      "is_running": false,
+      "ended_at": "2026-02-28T19:42:15.054Z",
+      "copilot_resume_id": "41084990-869e-425e-85d3-a6f71498f09d"
+    }
+  ]
+}

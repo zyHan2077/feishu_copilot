@@ -117,6 +117,7 @@ async function handleSlashCommand(
       '• /log head [N] — 日志头部\n' +
       '• /log grep <关键字> — 搜索日志\n' +
       '• /log sed <表达式> — 日志范围\n' +
+      '• /log awk/wc/cat [参数] — 其他日志操作\n' +
       '• /id — 查看自己的 open_id\n' +
       '• /h — 显示此帮助\n' +
       '💡 在话题（thread）中回复与 Copilot 交互；发送 /exit 退出并保存 resume ID；发送 /resume 在同一话题恢复'

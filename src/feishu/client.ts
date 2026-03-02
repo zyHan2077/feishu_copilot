@@ -1,4 +1,6 @@
 import axios from 'axios';
+import fs from 'fs';
+import FormData from 'form-data';
 
 const BASE = 'https://open.feishu.cn/open-apis';
 
@@ -164,4 +166,42 @@ export async function addReaction(messageId: string, emojiType = 'Get'): Promise
     const msg = axiosErr.response?.data?.msg ?? (err as Error).message;
     console.warn(`[addReaction] failed (non-fatal): code=${code} ${msg}`);
   }
+}
+
+/**
+ * Upload a local image file to Feishu and return the image_key.
+ */
+export async function uploadImage(filePath: string): Promise<string> {
+  const token = await getTenantToken();
+  const form = new FormData();
+  form.append('image_type', 'message');
+  form.append('image', fs.createReadStream(filePath));
+  const resp = await axios.post(
+    `${BASE}/im/v1/images`,
+    form,
+    { headers: { ...authHeader(token), ...form.getHeaders() } }
+  );
+  if (resp.data?.code !== 0) {
+    throw new Error(`uploadImage failed: code=${resp.data?.code} msg=${resp.data?.msg}`);
+  }
+  return resp.data.data.image_key as string;
+}
+
+/**
+ * Send an image message into an existing Feishu thread by replying to the anchor message.
+ * Returns the new message_id.
+ */
+export async function sendImageToThread(anchorMsgId: string, imageKey: string): Promise<string> {
+  const token = await getTenantToken();
+  const resp = await axios.post(
+    `${BASE}/im/v1/messages/${encodeURIComponent(anchorMsgId)}/reply`,
+    {
+      msg_type: 'image',
+      content: JSON.stringify({ image_key: imageKey }),
+      reply_in_thread: true,
+    },
+    { headers: authHeader(token) }
+  );
+  const d = resp.data?.data ?? {};
+  return (d.message_id as string) ?? '';
 }

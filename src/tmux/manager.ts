@@ -66,10 +66,16 @@ export function killWindow(sessionName: string, windowName: string): void {
  * Send keystrokes to a pane (window name defaults to session base window).
  * Uses two separate spawnSync calls: one for text (literal mode), one for Enter.
  * Combining text + 'Enter' in a single call silently drops Enter on some TUIs.
+ * For long text (>80 bytes), a short sync delay is inserted between the two calls
+ * to ensure the TUI finishes processing the characters before receiving Enter.
  */
 export function sendKeys(sessionName: string, windowName: string, keys: string): void {
   const target = `${sessionName}:${windowName}`;
   spawnSync('tmux', ['send-keys', '-t', target, '-l', keys]);
+  // For long messages the TUI may still be processing characters; wait before Enter.
+  if (Buffer.byteLength(keys) > 80) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+  }
   spawnSync('tmux', ['send-keys', '-t', target, 'Enter']);
 }
 
@@ -98,4 +104,12 @@ export function stripAnsi(str: string): string {
  */
 function shellEsc(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Set an environment variable in a tmux session so that child processes
+ * (e.g. MCP servers spawned by Copilot CLI) inherit it.
+ */
+export function setEnv(sessionName: string, key: string, value: string): void {
+  spawnSync('tmux', ['setenv', '-t', sessionName, key, value]);
 }

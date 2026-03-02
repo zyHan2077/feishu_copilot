@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { webhookHandler } from './feishu/webhook';
+import { mcpRouter } from './mcp/handler';
 
 const app = express();
 const PORT = process.env.PORT ?? 3000;
@@ -18,6 +19,9 @@ app.use(
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', ts: new Date().toISOString() });
 });
+
+// Persistent MCP server (handles all Copilot CLI tool calls via HTTP)
+app.use('/mcp', mcpRouter);
 
 // Feishu event webhook
 app.post('/webhook/event', (req: Request, res: Response) => {

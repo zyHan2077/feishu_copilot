@@ -47,11 +47,24 @@ feishu_copilot server  (Node.js / TypeScript, runs on host)
       │
       ├── State store  (per-group JSON, stored in workdir)
       │
+      ├── POST /mcp  ← Persistent HTTP MCP server (shared by all Copilot sessions)
+      │     └── Resolves target thread via ?chat_id=&session= query params
+      │
       └── tmux session (named after project)
-            └── GitHub Copilot CLI  (`gh copilot` / `copilot` session)
+            └── GitHub Copilot CLI  (`copilot` session)
+                  └── HTTP POST /mcp?chat_id=...&session=...
 ```
 
----
+### MCP Server Design
+
+The MCP server is **persistent** — it runs as part of the main Express server on `POST /mcp`, not as a per-session subprocess.
+
+**Thread routing logic:**
+- When `/on` is called, `writeMcpConfig(chatId, sessionLabel)` writes `~/.copilot/mcp-config.json` with `{ "mcpServers": { "feishu": { "url": "http://localhost:<PORT>/mcp?chat_id=<chat_id>&session=<session_label>" } } }`
+- Copilot CLI reads this config and sends all MCP tool calls as HTTP POSTs to that URL
+- The `/mcp` handler reads `chat_id` + `session` from query params → calls `getStateByChatId()` → finds the session → uses `anchor_msg_id` to send to the right Feishu thread
+- **No `FEISHU_WORKDIR` env var needed** — routing is precise via chat_id + session_label
+
 
 ## Core Rules
 
@@ -308,6 +321,7 @@ tmux send-keys -t copilot-feishu "cd /home/ubuntu/feishu_copilot && npm run buil
 
 - 优先使用**快速命令**（`/model`、`/context`、`/help`）验证 send-keys 通路，避免等待 LLM 响应。
 - 测试 LLM 实际响应时，先执行 `/model gpt-5-mini`——该模型在 Copilot Pro 计划中**免费**（不消耗 premium 配额）。
+- **⚠️ 直接调用 `copilot` 命令时**，必须加 `--model gpt-5-mini` 参数（`copilot --model gpt-5-mini`）以节省费用。
 - 每次 `/on` 产生**一个 tmux 窗口**，窗口名 = `session_label`（形如 `project-YYMMDD-HHMM`）。`new-session` 时传 `-n <session_label>` 来避免额外的空 bash 窗口。
 
 ### 架构变更后的必做清理（Schema/tmux 管理方式变动后）

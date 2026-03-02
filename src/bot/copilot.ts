@@ -8,6 +8,7 @@ import {
   sessionExists, createSession, createWindow, killWindow,
   windowExists, sendKeys, capturePane,
 } from '../tmux/manager';
+import { writeMcpConfig } from '../mcp/config';
 const POLL_INTERVAL_MS = 500;
 const IDLE_THRESHOLD_MS = 2000;
 const LOG_INTERVAL_MS = 5000;
@@ -60,6 +61,8 @@ export async function startCopilot(chatId: string, resumeId?: string, model?: st
   const startCmd = resumeId
     ? `copilot --resume=${resumeId}${model ? ` --model ${model}` : ''}`
     : model ? `copilot --model ${model}` : 'copilot';
+  // Write MCP config pointing to the persistent HTTP endpoint for this session.
+  writeMcpConfig(chatId, sessionLabel);
   sendKeys(state.project, sessionLabel, startCmd);
   await sleep(200);
   const baseline = capturePane(state.project, sessionLabel);
