@@ -1,83 +1,56 @@
 /**
- * Writes ~/.copilot/mcp-config.json with the feishu MCP server entry.
+ * MCP config helpers — write the static feishu HTTP MCP entry to the config files
+ * used by Copilot CLI (~/.copilot/mcp-config.json) and Claude Code (~/.claude.json).
  *
- * writeMcpConfig() is called at /on time (startCopilot) and writes an HTTP URL
- * that includes the chat_id and session_label as query params so the persistent
- * MCP handler can route tool calls to the correct Feishu thread.
- *
- * ensureMcpConfig() is kept for backward compatibility / manual fallback use.
+ * Both tools read `mcpServers` at the root of their respective JSON config files.
+ * Routing to the active Feishu thread is handled at call time via setActiveRoute()
+ * in active-route.ts — no session info is embedded in the URL.
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-const MCP_CONFIG_PATH = path.join(os.homedir(), '.copilot', 'mcp-config.json');
+const COPILOT_MCP_PATH = path.join(os.homedir(), '.copilot', 'mcp-config.json');
+const CLAUDE_JSON_PATH = path.join(os.homedir(), '.claude.json');
 const PORT = process.env.PORT ?? '8888';
+const STATIC_URL = `http://localhost:${PORT}/mcp`;
 
 /**
- * Write mcp-config.json pointing to the persistent HTTP MCP endpoint for a specific session.
- * Called by startCopilot() after the session_label is generated.
+ * Idempotently upsert `mcpServers.feishu` with the static HTTP entry in a JSON config file.
+ * Creates the file (and parent dirs) if missing. No-op if already set correctly.
  */
-export function writeMcpConfig(chatId: string, sessionLabel: string): void {
+function upsertFeishuEntry(filePath: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  let config: Record<string, unknown> = {};
   try {
-    fs.mkdirSync(path.dirname(MCP_CONFIG_PATH), { recursive: true });
+    config = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    // file missing or corrupt — start fresh
+  }
+  const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
+  if ((servers.feishu as { url?: string } | undefined)?.url === STATIC_URL) return;
+  servers.feishu = { type: 'http', url: STATIC_URL };
+  config.mcpServers = servers;
+  fs.writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf-8');
+  console.log(`[mcp/config] wrote feishu MCP entry to ${filePath}`);
+}
 
-    let config: Record<string, unknown> = {};
-    if (fs.existsSync(MCP_CONFIG_PATH)) {
-      try {
-        config = JSON.parse(fs.readFileSync(MCP_CONFIG_PATH, 'utf-8')) as Record<string, unknown>;
-      } catch {
-        config = {};
-      }
-    }
-
-    const encodedChatId = encodeURIComponent(chatId);
-    const encodedSession = encodeURIComponent(sessionLabel);
-    const url = `http://localhost:${PORT}/mcp?chat_id=${encodedChatId}&session=${encodedSession}`;
-
-    const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
-    servers.feishu = { type: 'http', url };
-    config.mcpServers = servers;
-
-    fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
-    console.log(`[mcp/config] wrote MCP config for session ${sessionLabel} (chat: ${chatId})`);
+/** Write/update the Copilot CLI MCP config (~/.copilot/mcp-config.json). */
+export function writeMcpConfig(): void {
+  try {
+    upsertFeishuEntry(COPILOT_MCP_PATH);
   } catch (e) {
-    console.warn('[mcp/config] failed to write MCP config (non-fatal):', (e as Error).message);
+    console.warn('[mcp/config] failed to write Copilot MCP config (non-fatal):', (e as Error).message);
   }
 }
 
-/**
- * @deprecated Use writeMcpConfig(chatId, sessionLabel) instead.
- * Kept as fallback for manual / pre-session use.
- */
-export function ensureMcpConfig(): void {
-  const SERVER_SCRIPT = path.join(__dirname, 'server.js');
+/** Write/update the Claude Code MCP config (~/.claude.json). */
+export function writeClaudeMcpConfig(): void {
   try {
-    fs.mkdirSync(path.dirname(MCP_CONFIG_PATH), { recursive: true });
-
-    let config: Record<string, unknown> = {};
-    if (fs.existsSync(MCP_CONFIG_PATH)) {
-      try {
-        config = JSON.parse(fs.readFileSync(MCP_CONFIG_PATH, 'utf-8')) as Record<string, unknown>;
-      } catch {
-        config = {};
-      }
-    }
-
-    const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
-    const existing = servers.feishu as { command?: string; args?: string[] } | undefined;
-
-    if (existing?.command === 'node' && existing?.args?.[0] === SERVER_SCRIPT) {
-      return;
-    }
-
-    servers.feishu = { command: 'node', args: [SERVER_SCRIPT] };
-    config.mcpServers = servers;
-
-    fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
-    console.log(`[mcp/config] wrote fallback stdio MCP config to ${MCP_CONFIG_PATH}`);
+    upsertFeishuEntry(CLAUDE_JSON_PATH);
   } catch (e) {
-    console.warn('[mcp/config] failed to write MCP config (non-fatal):', (e as Error).message);
+    console.warn('[mcp/config] failed to write Claude MCP config (non-fatal):', (e as Error).message);
   }
 }
+

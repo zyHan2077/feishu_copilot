@@ -92,6 +92,18 @@ export function capturePane(sessionName: string, windowName: string): string {
 }
 
 /**
+ * Capture full pane content including scrollback history (ANSI codes stripped).
+ * Use this for final output extraction, not for polling (scrollback can be large).
+ */
+export function captureFullPane(sessionName: string, windowName: string): string {
+  const result = spawnSync('tmux', [
+    'capture-pane', '-t', `${sessionName}:${windowName}`, '-p', '-e', '-S', '-',
+  ]);
+  const raw = result.stdout?.toString() ?? '';
+  return stripAnsi(raw);
+}
+
+/**
  * Strip ANSI escape codes from a string.
  */
 export function stripAnsi(str: string): string {

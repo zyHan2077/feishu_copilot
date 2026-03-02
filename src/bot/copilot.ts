@@ -9,6 +9,7 @@ import {
   windowExists, sendKeys, capturePane, captureFullPane,
 } from '../tmux/manager';
 import { writeMcpConfig } from '../mcp/config';
+import { setActiveRoute } from '../mcp/active-route';
 const POLL_INTERVAL_MS = 500;
 const IDLE_THRESHOLD_MS = 5000;
 const ACTIVITY_CHECK_DELAY_MS = 500;
@@ -41,8 +42,9 @@ function isInteractivePrompt(text: string): boolean {
  */
 function isCopilotBusy(sessionName: string, windowName: string): boolean {
   const pane = capturePane(sessionName, windowName);
-  const bottomLines = pane.split('\n').slice(-2).join('\n');
-  if (bottomLines.includes('ctrl+q')) return true;
+  // "ctrl+q enqueue" appears in the bottom bar during execution
+  if (pane.includes('ctrl+q')) return true;
+  // "Esc to cancel" appears in the response area during thinking/tool execution
   if (pane.includes('Esc to cancel')) return true;
   return false;
 }
@@ -77,8 +79,7 @@ export async function startCopilot(chatId: string, resumeId?: string, model?: st
   const startCmd = resumeId
     ? `copilot --resume=${resumeId}${model ? ` --model ${model}` : ''}`
     : model ? `copilot --model ${model}` : 'copilot';
-  // Write MCP config pointing to the persistent HTTP endpoint for this session.
-  writeMcpConfig(chatId, sessionLabel);
+  writeMcpConfig();
   sendKeys(state.project, sessionLabel, startCmd);
   await sleep(200);
   const baselineLineCount = captureFullPane(state.project, sessionLabel).split('\n').length;
@@ -232,6 +233,8 @@ export async function forwardToCopilot(chatId: string, session: CopilotSession, 
   }
 
   const baselineLineCount = captureFullPane(state.project, session.session_label).split('\n').length;
+  console.log(`[forward] baseline=${baselineLineCount}, sending text to ${key}`);
+  setActiveRoute(chatId, session.session_label);
   sendKeys(state.project, session.session_label, text);
   waitingWindows.add(key);
 
@@ -239,6 +242,7 @@ export async function forwardToCopilot(chatId: string, session: CopilotSession, 
     // First batch: wait for Copilot to finish (with activity-indicator check)
     const raw = await pollUntilIdle(state.project, session.session_label, 60_000, baselineLineCount, { requireIdle: true });
     const output = cleanCopilotOutput(raw);
+    console.log(`[forward] pollUntilIdle returned, output length=${output.length}, trimmed=${output.trim().length}`);
     if (output.trim()) {
       const prefix = isInteractivePrompt(output) ? '🔢 ' : '🤖 ';
       if (session.anchor_msg_id) {
@@ -246,53 +250,58 @@ export async function forwardToCopilot(chatId: string, session: CopilotSession, 
       } else {
         await sendMessage(chatId, prefix + output);
       }
+      console.log('[forward] first batch sent');
     }
 
-    // Continuation monitor: keep watching for follow-up output (safety net).
-    // Uses "last activity + timeout" semantics: deadline extends whenever pane changes,
-    // so long-running commands (e.g. 5×sleep 20s) don't time out prematurely.
-    let continuationBaseline = captureFullPane(state.project, session.session_label).split('\n').length;
-    let continuationLastActivity = Date.now();
-    let continuationLastChange = Date.now();
-    let continuationLastVisible = capturePane(state.project, session.session_label);
+    // If the task already completed during pollUntilIdle, skip the continuation.
+    // When the task is still running, we need to wait for busy→idle and capture the
+    // visible-pane output. The Copilot TUI renders in-place (response replaces thinking
+    // text at the same scrollback positions), so scrollback line-count alone cannot
+    // detect the final response.
+    const stillBusy = windowExists(state.project, session.session_label)
+      && isCopilotBusy(state.project, session.session_label);
+    if (stillBusy) {
+      let continuationLastActivity = Date.now();
+      let continuationLastChange = Date.now();
+      let continuationLastVisible = capturePane(state.project, session.session_label);
+      console.log('[forward] continuation start (task still running)');
 
-    while (Date.now() - continuationLastActivity < CONTINUATION_TIMEOUT_MS) {
-      await sleep(POLL_INTERVAL_MS);
-      if (!windowExists(state.project, session.session_label)) break;
-      const current = capturePane(state.project, session.session_label);
-      if (current !== continuationLastVisible) {
-        continuationLastVisible = current;
-        continuationLastChange = Date.now();
-        continuationLastActivity = Date.now(); // extend deadline on any pane activity
-      } else if (Date.now() - continuationLastChange >= CONTINUATION_IDLE_MS) {
-        // Stable for 3s — check if there's actually new content
-        const full = captureFullPane(state.project, session.session_label);
-        const allLines = full.split('\n');
-        if (allLines.length > continuationBaseline) {
-          const continuationRaw = allLines.slice(continuationBaseline).join('\n');
-          const continuationOutput = cleanCopilotOutput(continuationRaw);
-          if (continuationOutput.trim()) {
-            const prefix = isInteractivePrompt(continuationOutput) ? '🔢 ' : '📎 ';
-            if (session.anchor_msg_id) {
-              await sendToThread(session.anchor_msg_id, prefix + continuationOutput);
-            } else {
-              await sendMessage(chatId, prefix + continuationOutput);
+      while (Date.now() - continuationLastActivity < CONTINUATION_TIMEOUT_MS) {
+        await sleep(POLL_INTERVAL_MS);
+        if (!windowExists(state.project, session.session_label)) { console.log('[forward] window gone'); break; }
+        const current = capturePane(state.project, session.session_label);
+        if (current !== continuationLastVisible) {
+          continuationLastVisible = current;
+          continuationLastChange = Date.now();
+          continuationLastActivity = Date.now();
+        } else if (Date.now() - continuationLastChange >= CONTINUATION_IDLE_MS) {
+          const busy = isCopilotBusy(state.project, session.session_label);
+          if (!busy) {
+            // Task completed — capture visible pane as final output
+            console.log('[forward] task done (not busy), capturing final output');
+            const finalPane = capturePane(state.project, session.session_label);
+            const finalOutput = cleanCopilotOutput(finalPane);
+            if (finalOutput.trim()) {
+              const prefix = isInteractivePrompt(finalOutput) ? '🔢 ' : '🤖 ';
+              if (session.anchor_msg_id) {
+                await sendToThread(session.anchor_msg_id, prefix + finalOutput);
+              } else {
+                await sendMessage(chatId, prefix + finalOutput);
+              }
+              console.log(`[forward] final output sent (${finalOutput.length} chars)`);
             }
-          }
-          continuationBaseline = allLines.length;
-        } else {
-          // No new scrollback lines — check if Copilot is truly idle
-          if (!isCopilotBusy(state.project, session.session_label)) {
             break;
           }
-          // Tool still running silently — extend deadline and keep watching
+          // Still busy — keep monitoring
           continuationLastActivity = Date.now();
+          continuationLastChange = Date.now();
+          continuationLastVisible = capturePane(state.project, session.session_label);
         }
-        // Reset stable-wait timer for next continuation check
-        continuationLastChange = Date.now();
-        continuationLastVisible = capturePane(state.project, session.session_label);
       }
+    } else {
+      console.log('[forward] task already complete, skipping continuation');
     }
+    console.log('[forward] monitoring complete');
   } finally {
     waitingWindows.delete(key);
   }
@@ -320,8 +329,10 @@ async function pollUntilIdle(sessionName: string, windowName: string, timeoutMs:
         lastChangeTime = Date.now();
       } else if (requireIdle && isCopilotBusy(sessionName, windowName)) {
         // Pane stable but Copilot still executing (tool running silently) — keep waiting
+        console.log(`[poll] pane stable but busy, continuing (elapsed=${Math.round((Date.now() - (deadline - timeoutMs)) / 1000)}s)`);
         lastChangeTime = Date.now();
       } else {
+        console.log(`[poll] idle confirmed (requireIdle=${requireIdle}), breaking`);
         break;
       }
     }
@@ -338,10 +349,15 @@ function extractNewLines(full: string, baselineLineCount: number): string {
 
 const SEPARATOR_RE = /^[\s─═━─╌╍┄┅┈┉╎╏─━╼╾\-=*~]{3,}$/;
 const BOX_BORDER_RE = /^[╭╮╰╯│╔╗╚╝║╟╠╡╢╞╣╤╥╦╧╨╩╪╫┌┐└┘├┤┬┴┼][─│═ ╭╮╰╯║]*[╭╮╰╯│╔╗╚╝║╟╠╡╢╞╣╤╥╦╧╨╩╪╫┌┐└┘├┤┬┴┼]*$/;
-const SPINNER_RE = /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⣾⣽⣻⢿⡿⣟⣯⣷]\s/;
+const SPINNER_RE = /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒◎⣾⣽⣻⢿⡿⣟⣯⣷]\s/;
 const SHELL_PROMPT_RE = /^(\(base\)\s*)?\S+@\S+:.+[$#]\s*/;
 const INPUT_ECHO_RE = /^\s*❯\s/;
 const UI_HINT_RE = /shift\+tab\s+switch\s+mode/i;
+const COPILOT_STATUS_RE = /^\s*[~\/]\S.*\[⎇/;   // e.g. " ~/project [⎇ main*]  gpt-5-mini (medium)"
+const REMAINING_REQ_RE = /Remaining reqs\./i;
+const COPILOT_BANNER_RE = /GitHub Copilot v\d/;
+const COPILOT_ART_RE = /^[│╭╮╰╯\s█▘▝▔]*$/;  // ASCII art from the Copilot logo
+const COPILOT_BOILERPLATE_RE = /Copilot uses AI\. Check for mistakes\.|● Environment loaded:|● All permissions are now enabled\./;
 
 function cleanCopilotOutput(raw: string): string {
   const lines = raw.split('\n');
@@ -355,6 +371,11 @@ function cleanCopilotOutput(raw: string): string {
     if (SHELL_PROMPT_RE.test(line.trim())) continue;
     if (INPUT_ECHO_RE.test(line)) continue;
     if (UI_HINT_RE.test(line)) continue;
+    if (COPILOT_STATUS_RE.test(line)) continue;
+    if (REMAINING_REQ_RE.test(line)) continue;
+    if (COPILOT_BANNER_RE.test(line)) continue;
+    if (COPILOT_ART_RE.test(line.trim()) && line.trim().length < 30) continue;
+    if (COPILOT_BOILERPLATE_RE.test(line)) continue;
     line = line.replace(/^(\s*)│\s?/, '$1');
     const isBlank = line.trim() === '';
     if (isBlank && prevBlank) continue;

@@ -111,23 +111,28 @@ After initialisation:
 - Non-slash messages from non-developers are **silently ignored** (no reply).
 - The bot extracts the sender's `open_id` from the event and compares it against the stored `devs` list.
 
-### 4. Copilot session management
+### 4. Session management
 
-The bot supports **multiple concurrent Copilot sessions** per group, each with its own tmux window and Feishu thread.
+The bot supports **multiple concurrent sessions** per group — both Copilot CLI and Claude Code sessions — each with its own Feishu thread.
 
 Primary developer commands:
 
 | Context | Command | Bot action |
 |---|---|---|
 | Main chat | `/on [model=<name>]` (alias: `启动 copilot` / `start copilot`) | Start a new Copilot session; creates a new Feishu thread. Optional `model=` sets `copilot --model <name>`. |
-| Main chat | `/resume session-id=<UUID>` | Create a new thread and resume the given session via `copilot --resume=<UUID>`. |
+| Main chat | `/on --claude [model=<name>]` | Start a new Claude Code session; creates a new Feishu thread. Claude runs via `--print` mode (no TUI). |
+| Main chat | `/on --claude resume-id=<UUID>` | Start a new thread continuing a previous Claude conversation by session ID. |
+| Main chat | `/resume session-id=<UUID>` | Create a new thread and resume the given Copilot session via `copilot --resume=<UUID>`. |
 | Main chat | `/id` / `whoami` | Reply with the sender's `open_id`. |
 | Main chat | `/h` / `/help` / `help` / `帮助` | Show command reference. |
 | Main chat | `/log <subcmd>` (or `查看日志 <subcmd>`) | Query the session log (see §6). |
 | Main chat | `/init <workdir> <project> <devs>` | Re-initialise (allowed from existing devs). |
-| Thread | Any non-slash text | Forwarded verbatim to the Copilot TUI. |
-| Thread | `/exit` | Gracefully exit the session (see §4.2). |
-| Thread | `/resume` | Resume the most-recently-ended session in this same thread (see §4.3). |
+| Copilot thread | Any non-slash text | Forwarded verbatim to the Copilot TUI. |
+| Copilot thread | `/exit` | Gracefully exit the session (see §4.2). |
+| Copilot thread | `/resume` | Resume the most-recently-ended session in this same thread (see §4.3). |
+| Claude thread | Any non-slash text | Forwarded to Claude as `claude -p --output-format=stream-json --verbose --resume <session_id> "text"`. Context automatically maintained — **no `/resume` needed**. |
+| Claude thread | `/exit` | Mark session ended; posts resume hint to thread. |
+| Claude thread | `/kill` | Force-kill the active Claude subprocess (if stuck); marks session ended with resume hint. |
 
 #### 4.1 Starting a Copilot session (`/on`)
 
@@ -172,6 +177,22 @@ Non-slash developer messages → strip @mention → snapshot baseline → `sendK
 
 See **[docs/bot-behavior.md §5](../docs/bot-behavior.md)** for full details: interactive prompt handling, output cleaning patterns, and concurrent-request guard.
 
+### 5b. Forwarding Messages to Claude Code
+
+Claude sessions use a completely different mechanism — **no tmux, no polling**:
+
+1. Each thread reply spawns `claude -p --output-format=stream-json --verbose --permission-mode bypassPermissions [--resume <claude_session_id>] [--model <model>] "text"` with `cwd=workdir`
+2. Stdout is parsed as NDJSON:
+   - `{type:"system", subtype:"init", session_id:"<uuid>"}` → save `claude_session_id` on first message
+   - `{type:"assistant", message:{content:[{type:"tool_use", name:"..."}]}}` → collect tool names for summary
+   - `{type:"result", result:"<final text>", is_error:bool}` → send to thread
+3. Context is maintained **automatically** via `--resume <claude_session_id>` — users do NOT need to type `/resume`
+4. In-progress guard (per `session_label`) prevents concurrent calls; sends "⏳ Claude 仍在处理…" if busy
+5. **Idle timeout**: if no stream-json output for **5 minutes**, the subprocess is killed and an error is sent to the thread. The timer resets on each data chunk — long but active sessions (e.g. running bash tools) are NOT killed as long as output flows.
+6. **Process registry** (`activeProcesses: Map<string, ChildProcess>`): each active subprocess is registered by `session_label`. `/kill` terminates it externally and marks the session ended.
+7. `--permission-mode bypassPermissions` is required so tool calls (Bash, Edit, etc.) don't block waiting for permission prompts in non-interactive mode
+8. **`stdio: ['ignore', 'pipe', 'pipe']` is REQUIRED** on `spawn()` — if stdin is left as a pipe (the default), Claude Code detects the open pipe and blocks indefinitely waiting for input, even in `-p` mode. Pass `'ignore'` to give the child `/dev/null` as stdin.
+
 ### 6. Log Persistence
 
 Background loop (every 5 s) appends new pane lines (ISO-8601 prefixed) to `<workdir>/copilot_session.log`. Developer commands: `/log tail|head|grep|sed|awk|wc|cat [args]` (output truncated to 4000 chars). See **[docs/bot-behavior.md §6](../docs/bot-behavior.md#6-log-persistence)**.
@@ -193,14 +214,31 @@ On significant state changes (init, copilot stop), append a timestamped entry to
   "initialized_at": "2026-02-24T03:51:00Z",
   "sessions": [
     {
+      // Copilot session
       "session_label": "myapp-260301-0133",   // tmux window name; generated at /on time
+      "session_type": "copilot",              // "copilot" | "claude" (omit = "copilot" for compat)
       "thread_id": "omt_xxx",
       "anchor_msg_id": "om_xxx",              // "启动中" message in main chat
       "thread_first_msg_id": "om_yyy",        // "已就绪" message (edited after /exit)
       "ready_text": "✅ Copilot 已就绪…",     // original text for edit reconstruction
-      "copilot_resume_id": "9610b4bb-…",      // UUID from exit output (only after /exit)
+      "model": "gpt-5-mini",                  // optional model override
+      "copilot_resume_id": "9610b4bb-…",      // UUID from exit output (only after /exit, copilot only)
       "started_at": "2026-03-01T01:33:00Z",
       "ended_at": "2026-03-01T01:35:00Z",
+      "is_running": false
+    },
+    {
+      // Claude session
+      "session_label": "myapp-260301-0200-claude", // state key; no tmux window
+      "session_type": "claude",
+      "thread_id": "omt_yyy",
+      "anchor_msg_id": "om_bbb",
+      "thread_first_msg_id": "om_ccc",
+      "ready_text": "✅ Claude 已就绪…",
+      "model": "opus",                        // optional; passed as --model to each subprocess
+      "claude_session_id": "a8f2881e-…",      // UUID from stream-json init event; used for --resume
+      "started_at": "2026-03-01T02:00:00Z",
+      "ended_at": "2026-03-01T02:10:00Z",
       "is_running": false
     }
   ]
@@ -251,8 +289,7 @@ PORT=3000                             # HTTP server port
 
 ```
 feishu_copilot/
-├── .github/
-│   └── copilot-instructions.md   # ← this file
+├── CLAUDE.md                 # ← this file (project instructions for Claude & Copilot)
 ├── src/
 │   ├── index.ts          # HTTP server entry point
 │   ├── feishu/
@@ -261,7 +298,8 @@ feishu_copilot/
 │   ├── bot/
 │   │   ├── router.ts     # Route @mention commands to handlers
 │   │   ├── init.ts       # /init flow
-│   │   ├── copilot.ts    # Start/stop Copilot session, forward messages
+│   │   ├── copilot.ts    # Start/stop Copilot session (TUI + tmux polling)
+│   │   ├── claude.ts     # Start/stop Claude Code session (--print subprocess)
 │   │   ├── log.ts        # Log query handler
 │   │   └── progress.ts   # progress.md writer + Feishu notifier
 │   ├── tmux/
@@ -272,6 +310,10 @@ feishu_copilot/
 ├── package.json
 ├── tsconfig.json
 └── .env.example
+
+~/.claude/skills/
+└── feishu-server-admin/  # Copilot CLI skill for bot server administration
+    └── SKILL.md
 ```
 
 ---

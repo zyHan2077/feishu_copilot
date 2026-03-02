@@ -8,12 +8,15 @@ import path from 'path';
  * copilot_resume_id is the UUID extracted from copilot's exit output (only set after /exit).
  */
 export interface CopilotSession {
-  session_label: string;          // "project-YYMMDD-HHMM" — tmux window name
+  session_label: string;          // "project-YYMMDD-HHMM" — tmux window name (copilot) or state key (claude)
   thread_id: string;              // Feishu thread_id (omt_xxx)
   anchor_msg_id: string;          // message_id of the "启动中" anchor (main chat)
   thread_first_msg_id: string;    // message_id of the "已就绪" message (edited after exit)
   ready_text: string;             // original "已就绪" text (needed for the edit)
-  copilot_resume_id?: string;     // UUID from copilot --resume= (only after /exit)
+  session_type?: 'copilot' | 'claude'; // default: 'copilot' for backward compat
+  model?: string;                 // model override (claude: used per-call; copilot: used at start)
+  copilot_resume_id?: string;     // UUID from copilot --resume= (only after /exit, copilot only)
+  claude_session_id?: string;     // UUID from claude stream-json init event (claude only, for --resume)
   started_at: string;             // ISO-8601
   ended_at?: string;              // ISO-8601
   is_running: boolean;

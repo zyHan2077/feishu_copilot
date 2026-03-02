@@ -14,6 +14,7 @@ import path from 'path';
 import fs from 'fs';
 import { getStateByChatId } from '../state/store';
 import { uploadImage, sendImageToThread, sendToThread } from '../feishu/client';
+import { getActiveRoute } from './active-route';
 
 const router = Router();
 
@@ -91,8 +92,10 @@ async function handleSendFeishuImage(
 // ─── MCP JSON-RPC dispatcher ──────────────────────────────────────────────────
 
 router.post('/', async (req: Request, res: Response): Promise<void> => {
-  const chatId = (req.query.chat_id as string) ?? '';
-  const sessionLabel = (req.query.session as string) ?? '';
+  // URL params are optional — fall back to the in-memory active route set by forwardToClaude()
+  const route = getActiveRoute();
+  const chatId = (req.query.chat_id as string) || route.chatId;
+  const sessionLabel = (req.query.session as string) || route.sessionLabel;
 
   const body = req.body as { jsonrpc: string; id?: string | number | null; method: string; params?: Record<string, unknown> };
 

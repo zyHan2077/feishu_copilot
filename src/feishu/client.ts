@@ -87,6 +87,42 @@ export async function sendToThread(anchorMsgId: string, text: string): Promise<s
   return result.messageId;
 }
 
+// Feishu text message content limit (conservative — actual API limit is ~30KB but display clips earlier)
+const FEISHU_TEXT_LIMIT = 4000;
+
+/**
+ * Send a potentially long text to a thread, splitting into chunks if needed.
+ * Splits prefer newline boundaries to avoid cutting mid-sentence.
+ * Returns the message_id of the last sent chunk.
+ */
+export async function sendLongTextToThread(anchorMsgId: string, text: string): Promise<string> {
+  if (text.length <= FEISHU_TEXT_LIMIT) {
+    return sendToThread(anchorMsgId, text);
+  }
+
+  let remaining = text;
+  let lastMsgId = '';
+  let partIndex = 1;
+  const totalParts = Math.ceil(text.length / FEISHU_TEXT_LIMIT);
+
+  while (remaining.length > 0) {
+    let chunk = remaining.slice(0, FEISHU_TEXT_LIMIT);
+
+    // Prefer cutting at a newline boundary (at least halfway through the chunk)
+    const lastNewline = chunk.lastIndexOf('\n');
+    if (lastNewline > FEISHU_TEXT_LIMIT * 0.5) {
+      chunk = remaining.slice(0, lastNewline);
+    }
+
+    const header = totalParts > 1 ? `（${partIndex}/${totalParts}）\n` : '';
+    lastMsgId = await sendToThread(anchorMsgId, header + chunk);
+    remaining = remaining.slice(chunk.length).replace(/^\n/, '');
+    partIndex++;
+  }
+
+  return lastMsgId;
+}
+
 /**
  * Update the name (title) of a Feishu thread (话题).
  * Fails gracefully — logs the error but does not throw.

@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { webhookHandler } from './feishu/webhook';
 import { mcpRouter } from './mcp/handler';
+import { writeMcpConfig, writeClaudeMcpConfig } from './mcp/config';
 
 const app = express();
 const PORT = process.env.PORT ?? 3000;
@@ -33,6 +34,9 @@ app.post('/webhook/event', (req: Request, res: Response) => {
 
 app.listen(PORT, () => {
   console.log(`feishu-copilot listening on port ${PORT}`);
+  // Ensure MCP config files are always present at startup
+  writeMcpConfig();
+  writeClaudeMcpConfig();
 });
 
 export default app;

@@ -1,7 +1,8 @@
 import { sendMessage, sendToThread, addReaction } from '../feishu/client';
-import { getStateByChatId, getSessionByThread } from '../state/store';
+import { getStateByChatId, getSessionByThread, updateState } from '../state/store';
 import { sendInitPrompt, handleInit, isInitialized } from './init';
 import { startCopilot, exitCopilot, resumeCopilot, forwardToCopilot } from './copilot';
+import { startClaude, forwardToClaude, exitClaude, killClaudeSession } from './claude';
 import { handleLogQuery } from './log';
 
 export interface IncomingMessage {
@@ -23,11 +24,18 @@ export async function routeMessage(msg: IncomingMessage): Promise<void> {
 
   // ── 1. Not yet initialised ───────────────────────────────────────────────
   if (!isInitialized(chatId)) {
+    const lower = text.toLowerCase().trim();
+    // Allow /id and /whoami even when not initialized (useful for debugging)
+    if (lower === '/id' || lower === '/whoami') {
+      await sendMessage(chatId, `🪪 你的 open_id：\n${senderId}`);
+      return;
+    }
     if (text.startsWith('/init ')) {
       await handleInit(chatId, senderId, text);
-    } else {
+    } else if (text.startsWith('/')) {
       await sendInitPrompt(chatId);
     }
+    // plain text → silently ignore
     return;
   }
 
@@ -42,6 +50,50 @@ export async function routeMessage(msg: IncomingMessage): Promise<void> {
     if (!isDev) return; // silently ignore non-devs in thread
     if (messageId) addReaction(messageId).catch(() => {}); // 👍 "read" receipt
     const lowerText = text.toLowerCase().trim();
+
+    // Claude sessions: auto-continue context, no in-thread /resume needed
+    if (matchedSession.session_type === 'claude') {
+      if (lowerText === '/exit') {
+        if (!matchedSession.is_running) {
+          await sendToThread(matchedSession.anchor_msg_id, '⚠️ 此 session 当前未运行。');
+        } else {
+          await exitClaude(chatId, matchedSession);
+        }
+      } else if (lowerText === '/kill') {
+        if (!matchedSession.is_running) {
+          await sendToThread(matchedSession.anchor_msg_id, '⚠️ 此 session 当前未运行。');
+        } else {
+          const hadProcess = killClaudeSession(matchedSession.session_label);
+          // Mark session as ended
+          const now = new Date().toISOString();
+          const latest = getStateByChatId(chatId)!;
+          updateState(chatId, {
+            sessions: latest.sessions.map((s) =>
+              s.session_label === matchedSession.session_label
+                ? { ...s, is_running: false, ended_at: now }
+                : s,
+            ),
+          });
+          const resumeHint = matchedSession.claude_session_id
+            ? `\n\n💡 如需继续此对话，可在主聊天中发送：\n/on --claude resume-id=${matchedSession.claude_session_id}`
+            : '';
+          await sendToThread(
+            matchedSession.anchor_msg_id,
+            `🛑 Session 已强制终止。${hadProcess ? '（已杀死活跃进程）' : '（无活跃进程，状态已重置）'}${resumeHint}`,
+          );
+        }
+      } else if (matchedSession.is_running) {
+        await forwardToClaude(chatId, matchedSession, text);
+      } else {
+        await sendToThread(
+          matchedSession.anchor_msg_id,
+          `⚠️ 此 session 已结束。${matchedSession.claude_session_id ? `\n💡 可在主聊天中发送 /on --claude resume-id=${matchedSession.claude_session_id} 恢复对话。` : ''}`,
+        );
+      }
+      return;
+    }
+
+    // Copilot sessions (default)
     if (lowerText === '/exit') {
       if (!matchedSession.is_running) {
         await sendToThread(matchedSession.anchor_msg_id, '⚠️ 此 session 当前未运行。');
@@ -86,6 +138,14 @@ async function handleSlashCommand(
   text: string,
   lower: string,
 ): Promise<void> {
+  // /on --claude [model=<name>] [resume-id=<uuid>] — start claude session
+  if (lower === '/on --claude' || lower.startsWith('/on --claude ')) {
+    const modelMatch = text.match(/\bmodel=(\S+)/i);
+    const resumeMatch = text.match(/\bresume-id=([0-9a-f-]{36})/i);
+    await startClaude(chatId, resumeMatch?.[1], modelMatch?.[1]);
+    return;
+  }
+
   // /on [model=<name>] — start copilot
   if (lower === '/on' || lower === 'start copilot' || lower === '启动 copilot' || lower.startsWith('/on ')) {
     const modelMatch = text.match(/\bmodel=(\S+)/i);
@@ -101,18 +161,19 @@ async function handleSlashCommand(
   }
 
   // /id — whoami
-  if (lower === '/id' || lower === 'whoami') {
+    if (lower === '/id' || lower === '/whoami') {
     await sendMessage(chatId, `🪪 你的 open_id：\n${senderId}`);
     return;
   }
 
-  // /h or /help — help
   if (lower === '/h' || lower === '/help' || lower === 'help' || lower === '帮助') {
     await sendMessage(
       chatId,
       '📖 可用命令（在主聊天中发送）：\n' +
       '• /on [model=<模型名>] — 启动新 Copilot session（自动创建话题）\n' +
-      '• /resume session-id=<UUID> — 新话题中恢复指定 session\n' +
+      '• /on --claude [model=<模型名>] — 启动新 Claude Code session\n' +
+      '• /on --claude resume-id=<UUID> — 在新话题中恢复指定 Claude 会话\n' +
+      '• /resume session-id=<UUID> — 新话题中恢复指定 Copilot session\n' +
       '• /log tail [N] — 日志尾部（默认50行）\n' +
       '• /log head [N] — 日志头部\n' +
       '• /log grep <关键字> — 搜索日志\n' +
@@ -120,7 +181,8 @@ async function handleSlashCommand(
       '• /log awk/wc/cat [参数] — 其他日志操作\n' +
       '• /id — 查看自己的 open_id\n' +
       '• /h — 显示此帮助\n' +
-      '💡 在话题（thread）中回复与 Copilot 交互；发送 /exit 退出并保存 resume ID；发送 /resume 在同一话题恢复'
+      '💡 Copilot 话题：发送 /exit 退出并保存 resume ID；发送 /resume 在同一话题恢复\n' +
+      '💡 Claude 话题：直接回复即可保持上下文（自动 resume）；发送 /exit 结束 session；发送 /kill 强制终止卡住的进程'
     );
     return;
   }
