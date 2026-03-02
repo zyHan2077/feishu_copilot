@@ -37,7 +37,7 @@ export function writeMcpConfig(chatId: string, sessionLabel: string): void {
     const url = `http://localhost:${PORT}/mcp?chat_id=${encodedChatId}&session=${encodedSession}`;
 
     const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
-    servers.feishu = { url };
+    servers.feishu = { type: 'http', url };
     config.mcpServers = servers;
 
     fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
