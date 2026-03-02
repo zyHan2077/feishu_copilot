@@ -6,11 +6,14 @@ import {
 } from '../state/store';
 import {
   sessionExists, createSession, createWindow, killWindow,
-  windowExists, sendKeys, capturePane,
+  windowExists, sendKeys, capturePane, captureFullPane,
 } from '../tmux/manager';
 import { writeMcpConfig } from '../mcp/config';
 const POLL_INTERVAL_MS = 500;
-const IDLE_THRESHOLD_MS = 2000;
+const IDLE_THRESHOLD_MS = 5000;
+const ACTIVITY_CHECK_DELAY_MS = 500;
+const CONTINUATION_IDLE_MS = 3000;
+const CONTINUATION_TIMEOUT_MS = 10 * 60_000; // 10 min safety net for long-running tasks
 const LOG_INTERVAL_MS = 5000;
 
 // Per-session trackers keyed by "${project}:${session_label}"
@@ -29,6 +32,19 @@ const INTERACTIVE_PATTERNS = [
 
 function isInteractivePrompt(text: string): boolean {
   return INTERACTIVE_PATTERNS.some((p) => p.test(text));
+}
+
+/**
+ * Detect whether the Copilot CLI is currently busy (thinking or executing a tool).
+ * During execution the bottom bar shows "ctrl+q enqueue" and the response area
+ * contains "(Esc to cancel)". Neither is present when Copilot is idle at the prompt.
+ */
+function isCopilotBusy(sessionName: string, windowName: string): boolean {
+  const pane = capturePane(sessionName, windowName);
+  const bottomLines = pane.split('\n').slice(-2).join('\n');
+  if (bottomLines.includes('ctrl+q')) return true;
+  if (pane.includes('Esc to cancel')) return true;
+  return false;
 }
 
 /** Generate a session label of the form "project-YYMMDD-HHMM". Used as tmux window name. */
@@ -65,11 +81,11 @@ export async function startCopilot(chatId: string, resumeId?: string, model?: st
   writeMcpConfig(chatId, sessionLabel);
   sendKeys(state.project, sessionLabel, startCmd);
   await sleep(200);
-  const baseline = capturePane(state.project, sessionLabel);
+  const baselineLineCount = captureFullPane(state.project, sessionLabel).split('\n').length;
 
   const anchorMsgId = await sendMessage(chatId, `🤖 Copilot session 启动中… [${sessionLabel}]`);
 
-  const raw = await pollUntilIdle(state.project, sessionLabel, 15_000, baseline);
+  const raw = await pollUntilIdle(state.project, sessionLabel, 15_000, baselineLineCount);
   const initial = cleanCopilotOutput(raw);
 
   let threadId = '';
@@ -115,12 +131,12 @@ export async function exitCopilot(chatId: string, session: CopilotSession): Prom
   }
 
   const key = winKey(state.project, session.session_label);
-  const baseline = capturePane(state.project, session.session_label);
+  const baselineLineCount = captureFullPane(state.project, session.session_label).split('\n').length;
   sendKeys(state.project, session.session_label, '/exit');
   waitingWindows.add(key);
 
   try {
-    const raw = await pollUntilIdle(state.project, session.session_label, 15_000, baseline);
+    const raw = await pollUntilIdle(state.project, session.session_label, 15_000, baselineLineCount);
     const output = cleanCopilotOutput(raw);
 
     const uuidMatch = raw.match(/copilot --resume=([0-9a-f-]{36})/);
@@ -179,10 +195,10 @@ export async function resumeCopilot(chatId: string, existingSession: CopilotSess
 
   sendKeys(state.project, newLabel, `copilot --resume=${existingSession.copilot_resume_id}`);
   await sleep(200);
-  const baseline = capturePane(state.project, newLabel);
+  const baselineLineCount = captureFullPane(state.project, newLabel).split('\n').length;
   if (existingSession.anchor_msg_id) await sendToThread(existingSession.anchor_msg_id, '🔄 正在恢复 session…');
 
-  const raw = await pollUntilIdle(state.project, newLabel, 15_000, baseline);
+  const raw = await pollUntilIdle(state.project, newLabel, 15_000, baselineLineCount);
   const initial = cleanCopilotOutput(raw);
   const resumeText = `✅ Session 已恢复（${existingSession.copilot_resume_id}）${initial.trim() ? `\n\n${initial}` : ''}`;
   if (existingSession.anchor_msg_id) await sendToThread(existingSession.anchor_msg_id, resumeText);
@@ -215,12 +231,13 @@ export async function forwardToCopilot(chatId: string, session: CopilotSession, 
     return true;
   }
 
-  const baseline = capturePane(state.project, session.session_label);
+  const baselineLineCount = captureFullPane(state.project, session.session_label).split('\n').length;
   sendKeys(state.project, session.session_label, text);
   waitingWindows.add(key);
 
   try {
-    const raw = await pollUntilIdle(state.project, session.session_label, 60_000, baseline);
+    // First batch: wait for Copilot to finish (with activity-indicator check)
+    const raw = await pollUntilIdle(state.project, session.session_label, 60_000, baselineLineCount, { requireIdle: true });
     const output = cleanCopilotOutput(raw);
     if (output.trim()) {
       const prefix = isInteractivePrompt(output) ? '🔢 ' : '🤖 ';
@@ -230,33 +247,93 @@ export async function forwardToCopilot(chatId: string, session: CopilotSession, 
         await sendMessage(chatId, prefix + output);
       }
     }
+
+    // Continuation monitor: keep watching for follow-up output (safety net).
+    // Uses "last activity + timeout" semantics: deadline extends whenever pane changes,
+    // so long-running commands (e.g. 5×sleep 20s) don't time out prematurely.
+    let continuationBaseline = captureFullPane(state.project, session.session_label).split('\n').length;
+    let continuationLastActivity = Date.now();
+    let continuationLastChange = Date.now();
+    let continuationLastVisible = capturePane(state.project, session.session_label);
+
+    while (Date.now() - continuationLastActivity < CONTINUATION_TIMEOUT_MS) {
+      await sleep(POLL_INTERVAL_MS);
+      if (!windowExists(state.project, session.session_label)) break;
+      const current = capturePane(state.project, session.session_label);
+      if (current !== continuationLastVisible) {
+        continuationLastVisible = current;
+        continuationLastChange = Date.now();
+        continuationLastActivity = Date.now(); // extend deadline on any pane activity
+      } else if (Date.now() - continuationLastChange >= CONTINUATION_IDLE_MS) {
+        // Stable for 3s — check if there's actually new content
+        const full = captureFullPane(state.project, session.session_label);
+        const allLines = full.split('\n');
+        if (allLines.length > continuationBaseline) {
+          const continuationRaw = allLines.slice(continuationBaseline).join('\n');
+          const continuationOutput = cleanCopilotOutput(continuationRaw);
+          if (continuationOutput.trim()) {
+            const prefix = isInteractivePrompt(continuationOutput) ? '🔢 ' : '📎 ';
+            if (session.anchor_msg_id) {
+              await sendToThread(session.anchor_msg_id, prefix + continuationOutput);
+            } else {
+              await sendMessage(chatId, prefix + continuationOutput);
+            }
+          }
+          continuationBaseline = allLines.length;
+        } else {
+          // No new scrollback lines — check if Copilot is truly idle
+          if (!isCopilotBusy(state.project, session.session_label)) {
+            break;
+          }
+          // Tool still running silently — extend deadline and keep watching
+          continuationLastActivity = Date.now();
+        }
+        // Reset stable-wait timer for next continuation check
+        continuationLastChange = Date.now();
+        continuationLastVisible = capturePane(state.project, session.session_label);
+      }
+    }
   } finally {
     waitingWindows.delete(key);
   }
   return true;
 }
 
-async function pollUntilIdle(sessionName: string, windowName: string, timeoutMs: number, baseline = ''): Promise<string> {
+async function pollUntilIdle(sessionName: string, windowName: string, timeoutMs: number, baselineLineCount: number, options?: { requireIdle?: boolean }): Promise<string> {
+  const requireIdle = options?.requireIdle ?? false;
   const deadline = Date.now() + timeoutMs;
-  let lastContent = baseline;
+  let lastVisible = capturePane(sessionName, windowName);
   let lastChangeTime = Date.now();
   while (Date.now() < deadline) {
     await sleep(POLL_INTERVAL_MS);
     const current = capturePane(sessionName, windowName);
-    if (current !== lastContent) { lastContent = current; lastChangeTime = Date.now(); }
-    else if (Date.now() - lastChangeTime >= IDLE_THRESHOLD_MS) break;
+    if (current !== lastVisible) { lastVisible = current; lastChangeTime = Date.now(); }
+    else if (Date.now() - lastChangeTime >= IDLE_THRESHOLD_MS) {
+      // Confirm no activity indicator (spinner) in bottom 3 lines
+      await sleep(ACTIVITY_CHECK_DELAY_MS);
+      const recheck = capturePane(sessionName, windowName);
+      const bottomBefore = lastVisible.split('\n').slice(-3).join('\n');
+      const bottomAfter = recheck.split('\n').slice(-3).join('\n');
+      if (bottomBefore !== bottomAfter) {
+        // Bottom lines still changing — activity indicator present, keep waiting
+        lastVisible = recheck;
+        lastChangeTime = Date.now();
+      } else if (requireIdle && isCopilotBusy(sessionName, windowName)) {
+        // Pane stable but Copilot still executing (tool running silently) — keep waiting
+        lastChangeTime = Date.now();
+      } else {
+        break;
+      }
+    }
   }
-  return diffPaneContent(baseline, lastContent);
+  const full = captureFullPane(sessionName, windowName);
+  return extractNewLines(full, baselineLineCount);
 }
 
-function diffPaneContent(before: string, after: string): string {
-  const beforeLines = new Set(before.split('\n').map((l) => l.trimEnd()));
-  const newLines: string[] = [];
-  for (const line of after.split('\n')) {
-    const trimmed = line.trimEnd();
-    if (!beforeLines.has(trimmed)) newLines.push(trimmed);
-  }
-  return newLines.join('\n');
+/** Extract lines beyond baselineLineCount from a full scrollback capture. */
+function extractNewLines(full: string, baselineLineCount: number): string {
+  const lines = full.split('\n');
+  return lines.slice(baselineLineCount).join('\n');
 }
 
 const SEPARATOR_RE = /^[\s─═━─╌╍┄┅┈┉╎╏─━╼╾\-=*~]{3,}$/;
