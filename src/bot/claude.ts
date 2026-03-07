@@ -72,8 +72,8 @@ function runClaudeSubprocess(
 
     activeProcesses.set(sessionLabel, child);
 
-    // --- Session log file ---
-    const logDir = path.join(workdir, 'claude-logs');
+    // --- Session log file (all sessions centralised under bot's claude-logs/) ---
+    const logDir = path.join(__dirname, '../../claude-logs');
     fs.mkdirSync(logDir, { recursive: true });
     const logPath = path.join(logDir, `${sessionLabel}.log`);
     const logStream = fs.createWriteStream(logPath, { flags: 'a' });
@@ -86,7 +86,8 @@ function runClaudeSubprocess(
 
     // --- Periodic progress update setup ---
     const startTime = Date.now();
-    const recentActivity: string[] = []; // rolling buffer of recent assistant text / tool calls
+    const recentActivity: string[] = []; // rolling buffer for 3-min Feishu updates
+    const logActivity: string[] = [];    // rolling buffer for 5-s log flushes
     let lineBuffer = '';                  // partial-line accumulator for incremental JSON parsing
 
     /** Extract a human-readable summary from one parsed stream-json event. Returns '' if not interesting. */
@@ -138,9 +139,18 @@ function runClaudeSubprocess(
 
     const progressInterval = setInterval(sendProgressUpdate, PROGRESS_INTERVAL_MS);
 
+    // Flush log activity every 5 s (only if new content arrived)
+    const logFlushInterval = setInterval(() => {
+      if (logActivity.length === 0) return;
+      const ts = new Date().toISOString();
+      const lines = logActivity.splice(0).join('\n');
+      logStream.write(`[${ts}]\n${lines}\n\n`);
+    }, 5000);
+
     /** Stop progress timer and mark settled. */
     function stopProgress() {
       clearInterval(progressInterval);
+      clearInterval(logFlushInterval);
       clearTimeout(idleTimer);
     }
 
@@ -165,9 +175,8 @@ function runClaudeSubprocess(
       resetIdleTimer(); // activity detected — reset
       const text = chunk.toString();
       stdout += text;
-      logStream.write(text);
 
-      // Incremental line parsing for progress updates
+      // Incremental line parsing for progress updates and log
       lineBuffer += text;
       const parts = lineBuffer.split('\n');
       lineBuffer = parts.pop() ?? ''; // last part may be incomplete
@@ -177,15 +186,17 @@ function runClaudeSubprocess(
         try {
           const event = JSON.parse(trimmed) as Record<string, unknown>;
           const summary = summariseEvent(event);
-          if (summary) recentActivity.push(summary);
+          if (summary) {
+            recentActivity.push(summary);
+            logActivity.push(summary);
+          }
         } catch { /* non-JSON — ignore */ }
       }
     });
     child.stderr.on('data', (chunk: Buffer) => {
       resetIdleTimer();
-      const text = chunk.toString();
-      stderr += text;
-      logStream.write(`[stderr] ${text}`);
+      const text = chunk.toString().trim();
+      if (text) stderr += text + '\n';
     });
 
     child.on('close', () => {
