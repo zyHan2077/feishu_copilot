@@ -18,7 +18,25 @@ import { getActiveRoute } from './active-route';
 
 const router = Router();
 
-// ─── Tool definition ──────────────────────────────────────────────────────────
+// ─── Tool definitions ─────────────────────────────────────────────────────────
+
+const TOOL_FEISHU_PROGRESS = {
+  name: 'feishu_progress',
+  description:
+    'Send a brief progress update to the current Feishu thread. ' +
+    'Call this proactively during long tasks to keep the user informed. ' +
+    'Use concise Chinese (≤200 chars). Do not call more than once per minute.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      message: {
+        type: 'string',
+        description: 'Progress message in Chinese, e.g. "已分析完 X 模块，正在修改 Y 文件"',
+      },
+    },
+    required: ['message'],
+  },
+};
 
 const TOOL_DEF = {
   name: 'send_feishu_image',
@@ -41,7 +59,34 @@ const TOOL_DEF = {
   },
 };
 
-// ─── Tool implementation ──────────────────────────────────────────────────────
+// ─── Tool implementations ─────────────────────────────────────────────────────
+
+async function handleFeishuProgress(
+  args: Record<string, unknown>,
+  chatId: string,
+  sessionLabel: string,
+): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const msg = String(args.message ?? '').trim();
+  if (!msg) {
+    return { content: [{ type: 'text', text: 'ignored: empty message' }] };
+  }
+
+  const state = getStateByChatId(chatId);
+  if (!state) {
+    throw new Error(`No state found for chat_id: ${chatId}`);
+  }
+
+  const session =
+    state.sessions.find((s) => s.session_label === sessionLabel) ??
+    state.sessions.find((s) => s.is_running);
+
+  if (!session?.anchor_msg_id) {
+    throw new Error('No active session found in state.');
+  }
+
+  await sendToThread(session.anchor_msg_id, `🔄 ${msg}`);
+  return { content: [{ type: 'text', text: 'sent' }] };
+}
 
 async function handleSendFeishuImage(
   args: Record<string, unknown>,
@@ -121,13 +166,26 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
   }
 
   if (method === 'tools/list') {
-    ok({ tools: [TOOL_DEF] });
+    ok({ tools: [TOOL_FEISHU_PROGRESS, TOOL_DEF] });
     return;
   }
 
   if (method === 'tools/call') {
     const toolName = params?.name as string;
     const toolArgs = (params?.arguments ?? {}) as Record<string, unknown>;
+
+    if (toolName === 'feishu_progress') {
+      try {
+        const result = await handleFeishuProgress(toolArgs, chatId, sessionLabel);
+        ok(result);
+      } catch (e) {
+        ok({
+          content: [{ type: 'text', text: `❌ Error: ${(e as Error).message}` }],
+          isError: true,
+        });
+      }
+      return;
+    }
 
     if (toolName === 'send_feishu_image') {
       try {

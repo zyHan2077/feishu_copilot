@@ -17,11 +17,25 @@ const activeProcesses: Map<string, ChildProcess> = new Map();
 // Idle timeout: if no output for this many ms, the subprocess is considered stuck
 const CLAUDE_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes of silence = stuck
 
-// Periodic progress update interval while Claude is running
-const PROGRESS_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
+// Event-driven progress: minimum cooldown between consecutive pushes
+const PROGRESS_COOLDOWN_MS = 60 * 1000; // at most one push per 60 seconds
+
+// Fallback timer: send a heartbeat if no events have triggered a push
+const PROGRESS_FALLBACK_MS = 5 * 60 * 1000; // 5 minutes of inactivity fallback
 
 // Feishu message limit for progress updates (conservative)
 const PROGRESS_TEXT_LIMIT = 3800;
+
+/**
+ * Prepend a lightweight system instruction so Claude knows it can call
+ * the `feishu_progress` MCP tool to proactively report intermediate progress.
+ */
+function injectProgressInstruction(userText: string): string {
+  const instruction =
+    '[系统说明：若本次任务预计执行时间超过30秒，请在完成关键步骤后主动调用 feishu_progress 工具，' +
+    '用简洁中文（不超过150字）描述当前进展。每分钟至多调用一次，无需每个小步骤都汇报。]';
+  return `${instruction}\n\n${userText}`;
+}
 
 /** Generate a session label of the form "project-YYMMDD-HHMM-claude". */
 function makeSessionLabel(project: string, now: Date): string {
@@ -84,11 +98,12 @@ function runClaudeSubprocess(
     let settled = false;
     let idleTimer: ReturnType<typeof setTimeout>;
 
-    // --- Periodic progress update setup ---
+    // --- Event-driven progress update setup ---
     const startTime = Date.now();
-    const recentActivity: string[] = []; // rolling buffer for 3-min Feishu updates
+    const recentActivity: string[] = []; // rolling buffer for event-driven Feishu updates
     const logActivity: string[] = [];    // rolling buffer for 5-s log flushes
     let lineBuffer = '';                  // partial-line accumulator for incremental JSON parsing
+    let lastProgressAt = 0;              // timestamp of last progress push (for cooldown)
 
     /** Extract a human-readable summary from one parsed stream-json event. Returns '' if not interesting. */
     function summariseEvent(event: Record<string, unknown>): string {
@@ -122,22 +137,31 @@ function runClaudeSubprocess(
     /** Send accumulated activity to the Feishu thread (fire-and-forget). */
     function sendProgressUpdate() {
       if (!anchorMsgId) return;
-      const elapsedMin = Math.round((Date.now() - startTime) / 60000);
-      const header = `⏳ Claude 仍在处理中（已运行 ${elapsedMin} 分钟）`;
-      let body = recentActivity.join('\n').trim();
+      const body = recentActivity.join('\n').trim();
       recentActivity.length = 0; // clear buffer
-      if (!body) {
-        sendToThread(anchorMsgId, header + '…').catch(() => {});
-        return;
-      }
-      // Truncate to limit
-      if (body.length > PROGRESS_TEXT_LIMIT) {
-        body = '…' + body.slice(body.length - PROGRESS_TEXT_LIMIT);
-      }
-      sendToThread(anchorMsgId, `${header}\n\n最近动态：\n${body}`).catch(() => {});
+      if (!body) return; // nothing to say — skip silently
+      const elapsedMin = Math.round((Date.now() - startTime) / 60000);
+      const header = `⏳ 进行中（已运行 ${elapsedMin} 分钟）`;
+      const truncated = body.length > PROGRESS_TEXT_LIMIT
+        ? '…' + body.slice(body.length - PROGRESS_TEXT_LIMIT)
+        : body;
+      sendToThread(anchorMsgId, `${header}\n\n${truncated}`).catch(() => {});
+      lastProgressAt = Date.now();
     }
 
-    const progressInterval = setInterval(sendProgressUpdate, PROGRESS_INTERVAL_MS);
+    /** Trigger an event-driven progress push if cooldown has elapsed. */
+    function maybeSendProgressUpdate() {
+      if (Date.now() - lastProgressAt >= PROGRESS_COOLDOWN_MS) {
+        sendProgressUpdate();
+      }
+    }
+
+    // Fallback timer: fires only when no event-driven push has occurred recently
+    const progressInterval = setInterval(() => {
+      if (recentActivity.length > 0) {
+        sendProgressUpdate();
+      }
+    }, PROGRESS_FALLBACK_MS);
 
     // Flush log activity every 5 s (only if new content arrived)
     const logFlushInterval = setInterval(() => {
@@ -189,6 +213,7 @@ function runClaudeSubprocess(
           if (summary) {
             recentActivity.push(summary);
             logActivity.push(summary);
+            maybeSendProgressUpdate(); // event-driven: push if cooldown elapsed
           }
         } catch { /* non-JSON — ignore */ }
       }
@@ -328,7 +353,10 @@ export async function forwardToClaude(chatId: string, session: CopilotSession, t
     const freshSession = freshState?.sessions.find((s) => s.session_label === session.session_label);
     const currentSessionId = freshSession?.claude_session_id;
 
-    const result = await runClaudeSubprocess(text, state.workdir, currentSessionId, key, chatId, freshSession?.model, session.anchor_msg_id);
+    const result = await runClaudeSubprocess(
+      injectProgressInstruction(text),
+      state.workdir, currentSessionId, key, chatId, freshSession?.model, session.anchor_msg_id,
+    );
 
     // Save claude_session_id if this was the first message
     if (!currentSessionId && result.sessionId) {
